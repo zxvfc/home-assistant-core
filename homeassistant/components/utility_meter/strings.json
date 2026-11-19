@@ -30,6 +30,9 @@
     }
   },
   "exceptions": {
+    "meter_not_started": {
+      "message": "Cannot calibrate {entity_id} because it has not received a valid state from its source sensor yet."
+    },
     "unknown_entity": {
       "message": "Failed to set up utility_meter for unknown entity {entity_id}"
     }

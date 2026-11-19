@@ -36,6 +36,7 @@ from homeassistant.core import (
     async_noop,
     callback,
 )
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device import async_entity_id_to_device
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
@@ -474,12 +475,7 @@ class UtilityMeterSensor(RestoreSensor):
             parent_meter_info = self.hass.data[DATA_UTILITY][self._parent_meter]
             for sensor in parent_meter_info[DATA_TARIFF_SENSORS]:
                 sensor.start(new_state_attributes)
-                if self.native_unit_of_measurement is None:
-                    _LOGGER.warning(
-                        "Source sensor %s has no unit of measurement. Please %s",
-                        self._sensor_source_id,
-                        _suggest_report_issue(self.hass, self._sensor_source_id),
-                    )
+                self._warn_if_source_has_no_unit()
 
         if (
             adjustment := self.calculate_adjustment(old_state, new_state)
@@ -494,6 +490,34 @@ class UtilityMeterSensor(RestoreSensor):
             EntityStateAttribute.UNIT_OF_MEASUREMENT
         )
         self._last_valid_state = new_state_val
+        self.async_write_ha_state()
+
+    def _warn_if_source_has_no_unit(self) -> None:
+        """Log a warning if the meter has no unit after taking it from the source."""
+        if self.native_unit_of_measurement is None:
+            _LOGGER.warning(
+                "Source sensor %s has no unit of measurement. Please %s",
+                self._sensor_source_id,
+                _suggest_report_issue(self.hass, self._sensor_source_id),
+            )
+
+    def _sync_with_source(self) -> None:
+        """Start the meter or update its unit from the current source state."""
+        source_state = self.hass.states.get(self._sensor_source_id)
+        if source_state is None or self._validate_state(source_state) is None:
+            return
+
+        if self.native_value is None:
+            self.start(source_state.attributes)
+            self._warn_if_source_has_no_unit()
+            return
+
+        self._input_device_class = source_state.attributes.get(
+            EntityStateAttribute.DEVICE_CLASS
+        )
+        self._attr_native_unit_of_measurement = source_state.attributes.get(
+            EntityStateAttribute.UNIT_OF_MEASUREMENT
+        )
         self.async_write_ha_state()
 
     @callback
@@ -569,11 +593,19 @@ class UtilityMeterSensor(RestoreSensor):
         self._last_period = (
             Decimal(self.native_value) if self.native_value else Decimal(0)
         )
-        self._attr_native_value = 0
+        # A meter without a source reading has no unit yet, so it stays unknown
+        if self.native_value is not None:
+            self._attr_native_value = 0
         self.async_write_ha_state()
 
     async def async_calibrate(self, value):
         """Calibrate the Utility Meter with a given value."""
+        if self.native_value is None:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="meter_not_started",
+                translation_placeholders={"entity_id": self.entity_id},
+            )
         _LOGGER.debug("Calibrate %s = %s type(%s)", self.name, value, type(value))
         self._attr_native_value = Decimal(str(value))
         self.async_write_ha_state()
@@ -626,23 +658,21 @@ class UtilityMeterSensor(RestoreSensor):
                     )
                 )
 
-                tariff_entity_state = self.hass.states.get(self._tariff_entity)
-                if not tariff_entity_state:
-                    # The utility meter is not yet added
-                    return
+                # The tariff select entity may not be added yet
+                if tariff_entity_state := self.hass.states.get(self._tariff_entity):
+                    self._change_status(tariff_entity_state.state)
+            else:
+                _LOGGER.debug(
+                    "<%s> collecting %s from %s",
+                    self.name,
+                    self.native_unit_of_measurement,
+                    self._sensor_source_id,
+                )
+                self._collecting = async_track_state_change_event(
+                    self.hass, [self._sensor_source_id], self.async_reading
+                )
 
-                self._change_status(tariff_entity_state.state)
-                return
-
-            _LOGGER.debug(
-                "<%s> collecting %s from %s",
-                self.name,
-                self.native_unit_of_measurement,
-                self._sensor_source_id,
-            )
-            self._collecting = async_track_state_change_event(
-                self.hass, [self._sensor_source_id], self.async_reading
-            )
+            self._sync_with_source()
 
         self.async_on_remove(async_at_started(self.hass, async_source_tracking))
 
