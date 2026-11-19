@@ -399,17 +399,13 @@ class UtilityMeterSensor(RestoreSensor):
 
     def _sync_unit_with_source(self) -> bool:
         """Take unit and device class from the source if the meter has no unit."""
-        if (
-            self.native_unit_of_measurement is not None
-            or (source_state := self.hass.states.get(self._sensor_source_id)) is None
-            or self._validate_state(source_state) is None
-            or (
-                unit := source_state.attributes.get(
-                    EntityStateAttribute.UNIT_OF_MEASUREMENT
-                )
-            )
-            is None
-        ):
+        if self.native_unit_of_measurement is not None:
+            return False
+        source_state = self.hass.states.get(self._sensor_source_id)
+        if source_state is None or self._validate_state(source_state) is None:
+            return False
+        unit = source_state.attributes.get(EntityStateAttribute.UNIT_OF_MEASUREMENT)
+        if unit is None:
             return False
         self._input_device_class = source_state.attributes.get(
             EntityStateAttribute.DEVICE_CLASS

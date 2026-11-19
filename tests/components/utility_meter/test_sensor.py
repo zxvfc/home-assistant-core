@@ -2476,49 +2476,45 @@ async def test_new_meter_without_source_value_at_start(
 
 @pytest.mark.parametrize("setup_meter", SETUP_METER_PARAMS)
 @pytest.mark.parametrize("reset_meter", RESET_METER_PARAMS)
-async def test_reset_meter_without_value_and_unit(
+@pytest.mark.parametrize(
+    ("source_states", "expected_state", "expected_unit"),
+    [
+        pytest.param([], STATE_UNKNOWN, None, id="source_missing"),
+        pytest.param([("10", {})], STATE_UNKNOWN, None, id="source_without_unit"),
+        pytest.param(
+            [("10", SOURCE_ENERGY_ATTRIBUTES)],
+            "0",
+            UnitOfEnergy.KILO_WATT_HOUR,
+            id="source_with_unit",
+        ),
+    ],
+)
+async def test_reset_meter_without_value(
     hass: HomeAssistant,
     freezer: FrozenDateTimeFactory,
     setup_meter: SetupMeter,
     reset_meter: ResetMeter,
+    source_states: list[tuple[str, dict[str, str]]],
+    expected_state: str,
+    expected_unit: str | None,
 ) -> None:
-    """Test a reset does not turn a meter without value and unit into 0."""
+    """Test a reset turns a meter without value into 0 only if it has a unit."""
     freezer.move_to("2026-01-01 10:30:00+00:00")
     hass.set_state(CoreState.not_running)
+    for source_state, source_attributes in source_states:
+        hass.states.async_set(SOURCE_ENTITY_ID, source_state, source_attributes)
     await setup_meter(hass, cycle=HOURLY)
     await _async_start_hass(hass)
 
     await reset_meter(hass, freezer)
 
     state = hass.states.get(METER_ENTITY_ID)
-    assert state.state == STATE_UNKNOWN
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) is None
+    assert state.state == expected_state
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == expected_unit
     assert (
         state.attributes.get(UtilityMeterEntityStateAttribute.LAST_RESET)
         == "2026-01-01T11:00:01+00:00"
     )
-
-
-@pytest.mark.parametrize("setup_meter", SETUP_METER_PARAMS)
-@pytest.mark.parametrize("reset_meter", RESET_METER_PARAMS)
-async def test_reset_meter_without_value_with_unit(
-    hass: HomeAssistant,
-    freezer: FrozenDateTimeFactory,
-    setup_meter: SetupMeter,
-    reset_meter: ResetMeter,
-) -> None:
-    """Test a reset of a meter that took the source unit at start gives 0 with it."""
-    freezer.move_to("2026-01-01 10:30:00+00:00")
-    hass.set_state(CoreState.not_running)
-    hass.states.async_set(SOURCE_ENTITY_ID, "10", SOURCE_ENERGY_ATTRIBUTES)
-    await setup_meter(hass, cycle=HOURLY)
-    await _async_start_hass(hass)
-
-    await reset_meter(hass, freezer)
-
-    state = hass.states.get(METER_ENTITY_ID)
-    assert state.state == "0"
-    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UnitOfEnergy.KILO_WATT_HOUR
 
 
 @pytest.mark.parametrize("setup_meter", SETUP_METER_PARAMS)
@@ -2581,7 +2577,7 @@ async def test_restored_meter_unit_at_start(
     freezer: FrozenDateTimeFactory,
     setup_meter: SetupMeter,
     restored_unit: str | None,
-    restored_device_class: str | None,
+    restored_device_class: SensorDeviceClass | None,
     expected_unit: str,
 ) -> None:
     """Test only a restored meter without unit takes the source unit at start."""

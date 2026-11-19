@@ -24,6 +24,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 
+SOURCE_ENTITY_ID = "sensor.energy"
 METER_ENTITY_ID = "sensor.energy_bill"
 
 
@@ -33,7 +34,7 @@ async def test_reset_before_first_source_change_statistics_unit(
     """Test a meter reset before the source changes compiles statistics in kWh."""
     freezer.move_to("2026-01-01 10:01:00+00:00")
     hass.states.async_set(
-        "sensor.energy",
+        SOURCE_ENTITY_ID,
         "10",
         {
             ATTR_UNIT_OF_MEASUREMENT: UnitOfEnergy.KILO_WATT_HOUR,
@@ -41,7 +42,7 @@ async def test_reset_before_first_source_change_statistics_unit(
         },
     )
     assert await async_setup_component(
-        hass, DOMAIN, {DOMAIN: {"energy_bill": {"source": "sensor.energy"}}}
+        hass, DOMAIN, {DOMAIN: {"energy_bill": {"source": SOURCE_ENTITY_ID}}}
     )
     await hass.async_block_till_done()
 
