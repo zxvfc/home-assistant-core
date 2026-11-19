@@ -397,6 +397,22 @@ class UtilityMeterSensor(RestoreSensor):
         self._attr_native_value = 0
         self.async_write_ha_state()
 
+    def _sync_unit_with_source(self) -> bool:
+        """Take unit and device class from the source if the meter has no unit."""
+        if self.native_unit_of_measurement is not None:
+            return False
+        source_state = self.hass.states.get(self._sensor_source_id)
+        if source_state is None or self._validate_state(source_state) is None:
+            return False
+        unit = source_state.attributes.get(EntityStateAttribute.UNIT_OF_MEASUREMENT)
+        if unit is None:
+            return False
+        self._input_device_class = source_state.attributes.get(
+            EntityStateAttribute.DEVICE_CLASS
+        )
+        self._attr_native_unit_of_measurement = unit
+        return True
+
     @staticmethod
     def _validate_state(state: State | None) -> Decimal | None:
         """Parse the state as a Decimal if available."""
@@ -569,12 +585,15 @@ class UtilityMeterSensor(RestoreSensor):
         self._last_period = (
             Decimal(self.native_value) if self.native_value else Decimal(0)
         )
-        self._attr_native_value = 0
+        # A 0 without unit would make the recorder compile unitless statistics
+        if self.native_value is not None or self.native_unit_of_measurement is not None:
+            self._attr_native_value = 0
         self.async_write_ha_state()
 
     async def async_calibrate(self, value):
         """Calibrate the Utility Meter with a given value."""
         _LOGGER.debug("Calibrate %s = %s type(%s)", self.name, value, type(value))
+        self._sync_unit_with_source()
         self._attr_native_value = Decimal(str(value))
         self.async_write_ha_state()
 
@@ -616,6 +635,9 @@ class UtilityMeterSensor(RestoreSensor):
         @callback
         def async_source_tracking(event):
             """Wait for source to be ready, then start meter."""
+            if self._sync_unit_with_source():
+                self.async_write_ha_state()
+
             if self._tariff_entity is not None:
                 _LOGGER.debug(
                     "<%s> tracks utility meter %s", self.name, self._tariff_entity
