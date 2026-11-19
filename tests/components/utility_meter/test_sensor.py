@@ -1,9 +1,11 @@
 """The tests for the utility_meter sensor platform."""
 
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from decimal import Decimal
 
 from freezegun import freeze_time
+from freezegun.api import FrozenDateTimeFactory
 import pytest
 from pytest_homeassistant.common import (
     MockConfigEntry,
@@ -2321,3 +2323,325 @@ async def test_device_id_yaml(
     assert utility_meter_entity is not None
     assert utility_meter_entity.device_id is None
     assert "attempts to attach a device to an entity" not in caplog.text
+
+
+SOURCE_ENTITY_ID = "sensor.energy"
+METER_ENTITY_ID = "sensor.energy_bill"
+SOURCE_ENERGY_ATTRIBUTES = {
+    ATTR_UNIT_OF_MEASUREMENT: UnitOfEnergy.KILO_WATT_HOUR,
+    ATTR_DEVICE_CLASS: SensorDeviceClass.ENERGY,
+}
+
+type SetupMeter = Callable[..., Awaitable[None]]
+type ResetMeter = Callable[[HomeAssistant, FrozenDateTimeFactory], Awaitable[None]]
+
+
+async def _async_setup_yaml_meter(
+    hass: HomeAssistant, cycle: str = "monthly", tariffs: list[str] | None = None
+) -> None:
+    """Set up the energy_bill meter from YAML."""
+    assert await async_setup_component(
+        hass,
+        DOMAIN,
+        {
+            DOMAIN: {
+                "energy_bill": {
+                    "source": SOURCE_ENTITY_ID,
+                    "cycle": cycle,
+                    "tariffs": tariffs or [],
+                }
+            }
+        },
+    )
+    await hass.async_block_till_done()
+
+
+async def _async_setup_config_entry_meter(
+    hass: HomeAssistant, cycle: str = "monthly", tariffs: list[str] | None = None
+) -> None:
+    """Set up the energy_bill meter from a config entry."""
+    config_entry = MockConfigEntry(
+        data={},
+        domain=DOMAIN,
+        options={
+            "cycle": cycle,
+            "delta_values": False,
+            "name": "Energy bill",
+            "net_consumption": False,
+            "offset": 0,
+            "periodically_resetting": True,
+            "source": SOURCE_ENTITY_ID,
+            "tariffs": tariffs or [],
+        },
+        title="Energy bill",
+    )
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+
+SETUP_METER_PARAMS = [
+    pytest.param(_async_setup_yaml_meter, id="yaml"),
+    pytest.param(_async_setup_config_entry_meter, id="config_entry"),
+]
+
+
+async def _async_start_hass(hass: HomeAssistant) -> None:
+    """Finish Home Assistant start so meters begin tracking their source."""
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+
+
+async def _async_reset_by_service(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """Reset the meter with the reset action."""
+    freezer.move_to("2026-01-01 11:00:01+00:00")
+    await hass.services.async_call(
+        DOMAIN,
+        UtilityMeterService.RESET,
+        target={TargetKey.ENTITY_ID: METER_ENTITY_ID},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+
+async def _async_reset_by_schedule(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """Let the hourly cycle reset the meter."""
+    freezer.move_to("2026-01-01 11:00:01+00:00")
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
+
+RESET_METER_PARAMS = [
+    pytest.param(_async_reset_by_service, id="reset_action"),
+    pytest.param(_async_reset_by_schedule, id="scheduled_reset"),
+]
+
+
+@pytest.mark.parametrize("setup_meter", SETUP_METER_PARAMS)
+async def test_new_meter_takes_source_unit_at_start(
+    hass: HomeAssistant, setup_meter: SetupMeter
+) -> None:
+    """Test a new meter takes unit and device class from the source at start."""
+    hass.set_state(CoreState.not_running)
+    hass.states.async_set(SOURCE_ENTITY_ID, "10", SOURCE_ENERGY_ATTRIBUTES)
+    await setup_meter(hass)
+    await _async_start_hass(hass)
+
+    state = hass.states.get(METER_ENTITY_ID)
+    assert state.state == STATE_UNKNOWN
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UnitOfEnergy.KILO_WATT_HOUR
+    assert state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.ENERGY
+
+    # The source value found at start is not added to the meter
+    hass.states.async_set(SOURCE_ENTITY_ID, "13", SOURCE_ENERGY_ATTRIBUTES)
+    await hass.async_block_till_done()
+
+    assert hass.states.get(METER_ENTITY_ID).state == "3"
+
+
+@pytest.mark.parametrize("setup_meter", SETUP_METER_PARAMS)
+@pytest.mark.parametrize(
+    "source_states",
+    [
+        pytest.param([], id="source_missing"),
+        pytest.param([STATE_UNKNOWN], id="source_unknown"),
+        pytest.param([STATE_UNAVAILABLE], id="source_unavailable"),
+    ],
+)
+async def test_new_meter_without_source_value_at_start(
+    hass: HomeAssistant, setup_meter: SetupMeter, source_states: list[str]
+) -> None:
+    """Test a new meter gets its unit on the first valid source change."""
+    hass.set_state(CoreState.not_running)
+    for source_state in source_states:
+        hass.states.async_set(SOURCE_ENTITY_ID, source_state, SOURCE_ENERGY_ATTRIBUTES)
+    await setup_meter(hass)
+    await _async_start_hass(hass)
+
+    state = hass.states.get(METER_ENTITY_ID)
+    assert state.state == STATE_UNKNOWN
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) is None
+
+    hass.states.async_set(SOURCE_ENTITY_ID, "13", SOURCE_ENERGY_ATTRIBUTES)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(METER_ENTITY_ID)
+    assert state.state == "0"
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UnitOfEnergy.KILO_WATT_HOUR
+
+
+@pytest.mark.parametrize("setup_meter", SETUP_METER_PARAMS)
+@pytest.mark.parametrize("reset_meter", RESET_METER_PARAMS)
+async def test_reset_meter_without_value_and_unit(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    setup_meter: SetupMeter,
+    reset_meter: ResetMeter,
+) -> None:
+    """Test a reset does not turn a meter without value and unit into 0."""
+    freezer.move_to("2026-01-01 10:30:00+00:00")
+    hass.set_state(CoreState.not_running)
+    await setup_meter(hass, cycle=HOURLY)
+    await _async_start_hass(hass)
+
+    await reset_meter(hass, freezer)
+
+    state = hass.states.get(METER_ENTITY_ID)
+    assert state.state == STATE_UNKNOWN
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) is None
+    assert (
+        state.attributes.get(UtilityMeterEntityStateAttribute.LAST_RESET)
+        == "2026-01-01T11:00:01+00:00"
+    )
+
+
+@pytest.mark.parametrize("setup_meter", SETUP_METER_PARAMS)
+@pytest.mark.parametrize("reset_meter", RESET_METER_PARAMS)
+async def test_reset_meter_without_value_with_unit(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    setup_meter: SetupMeter,
+    reset_meter: ResetMeter,
+) -> None:
+    """Test a reset of a meter that took the source unit at start gives 0 with it."""
+    freezer.move_to("2026-01-01 10:30:00+00:00")
+    hass.set_state(CoreState.not_running)
+    hass.states.async_set(SOURCE_ENTITY_ID, "10", SOURCE_ENERGY_ATTRIBUTES)
+    await setup_meter(hass, cycle=HOURLY)
+    await _async_start_hass(hass)
+
+    await reset_meter(hass, freezer)
+
+    state = hass.states.get(METER_ENTITY_ID)
+    assert state.state == "0"
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == UnitOfEnergy.KILO_WATT_HOUR
+
+
+@pytest.mark.parametrize("setup_meter", SETUP_METER_PARAMS)
+@pytest.mark.parametrize(
+    ("source_attributes", "expected_unit", "expected_device_class"),
+    [
+        pytest.param(
+            SOURCE_ENERGY_ATTRIBUTES,
+            UnitOfEnergy.KILO_WATT_HOUR,
+            SensorDeviceClass.ENERGY,
+            id="source_with_unit",
+        ),
+        pytest.param({}, None, None, id="source_without_unit"),
+    ],
+)
+async def test_calibrate_meter_without_unit(
+    hass: HomeAssistant,
+    setup_meter: SetupMeter,
+    source_attributes: dict[str, str],
+    expected_unit: str | None,
+    expected_device_class: SensorDeviceClass | None,
+) -> None:
+    """Test calibrating a meter without unit takes the unit from the source."""
+    # Home Assistant is still starting, so the meter has not looked at the source
+    hass.set_state(CoreState.not_running)
+    hass.states.async_set(SOURCE_ENTITY_ID, "10", source_attributes)
+    await setup_meter(hass)
+
+    await hass.services.async_call(
+        DOMAIN,
+        UtilityMeterService.CALIBRATE,
+        {
+            TargetKey.ENTITY_ID: METER_ENTITY_ID,
+            UtilityMeterServiceArgument.VALUE: "100",
+        },
+        blocking=True,
+    )
+
+    state = hass.states.get(METER_ENTITY_ID)
+    assert state.state == "100"
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == expected_unit
+    assert state.attributes.get(ATTR_DEVICE_CLASS) == expected_device_class
+
+
+@pytest.mark.parametrize("setup_meter", SETUP_METER_PARAMS)
+@pytest.mark.parametrize(
+    ("restored_unit", "restored_device_class", "expected_unit"),
+    [
+        pytest.param(
+            UnitOfEnergy.KILO_WATT_HOUR,
+            SensorDeviceClass.ENERGY,
+            UnitOfEnergy.KILO_WATT_HOUR,
+            id="restored_with_unit",
+        ),
+        pytest.param(None, None, UnitOfEnergy.WATT_HOUR, id="restored_without_unit"),
+    ],
+)
+async def test_restored_meter_unit_at_start(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    setup_meter: SetupMeter,
+    restored_unit: str | None,
+    restored_device_class: str | None,
+    expected_unit: str,
+) -> None:
+    """Test only a restored meter without unit takes the source unit at start."""
+    freezer.move_to("2026-01-01 10:30:00+00:00")
+    hass.set_state(CoreState.not_running)
+    mock_restore_cache_with_extra_data(
+        hass,
+        [
+            (
+                State(METER_ENTITY_ID, "5"),
+                {
+                    "native_value": {
+                        "__type": "<class 'decimal.Decimal'>",
+                        "decimal_str": "5",
+                    },
+                    "native_unit_of_measurement": restored_unit,
+                    "last_reset": "2026-01-01T00:00:00+00:00",
+                    "last_period": "0",
+                    "last_valid_state": None,
+                    "status": COLLECTING,
+                    "input_device_class": restored_device_class,
+                },
+            )
+        ],
+    )
+    hass.states.async_set(
+        SOURCE_ENTITY_ID,
+        "10",
+        {
+            ATTR_UNIT_OF_MEASUREMENT: UnitOfEnergy.WATT_HOUR,
+            ATTR_DEVICE_CLASS: SensorDeviceClass.ENERGY,
+        },
+    )
+    await setup_meter(hass)
+    await _async_start_hass(hass)
+
+    state = hass.states.get(METER_ENTITY_ID)
+    assert state.state == "5"
+    assert state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) == expected_unit
+    assert state.attributes.get(ATTR_DEVICE_CLASS) == SensorDeviceClass.ENERGY
+
+
+@pytest.mark.parametrize("setup_meter", SETUP_METER_PARAMS)
+async def test_all_tariff_meters_take_source_unit_at_start(
+    hass: HomeAssistant, setup_meter: SetupMeter
+) -> None:
+    """Test collecting and paused tariff meters take the source unit at start."""
+    hass.set_state(CoreState.not_running)
+    hass.states.async_set(SOURCE_ENTITY_ID, "10", SOURCE_ENERGY_ATTRIBUTES)
+    await setup_meter(hass, tariffs=["peak", "offpeak"])
+    await _async_start_hass(hass)
+
+    for entity_id, status in (
+        ("sensor.energy_bill_peak", COLLECTING),
+        ("sensor.energy_bill_offpeak", PAUSED),
+    ):
+        state = hass.states.get(entity_id)
+        assert state.state == STATE_UNKNOWN
+        assert state.attributes.get(UtilityMeterEntityStateAttribute.STATUS) == status
+        assert (
+            state.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
+            == UnitOfEnergy.KILO_WATT_HOUR
+        )
